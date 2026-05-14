@@ -1,24 +1,27 @@
+import os
 import pandas as pd
-import sqlite3
+from datetime import datetime
 
-DB = sqlite3.connect("scraper.db")
+from config import EXPORTS_DIR
+from database.db import DB
+from utils.logger import log
+
+os.makedirs(EXPORTS_DIR, exist_ok=True)
 
 
-def export_companies():
+def export_companies(filename: str | None = None) -> str:
+    """Export all companies to CSV. Returns the output file path."""
+    if filename is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"companies_{ts}.csv"
 
-    query = """
-    SELECT *
-    FROM companies
-    """
+    out_path = os.path.join(EXPORTS_DIR, filename)
 
     df = pd.read_sql(
-        query,
+        "SELECT * FROM companies ORDER BY company_name",
         DB
     )
 
-    df.to_csv(
-        "exports/companies.csv",
-        index=False
-    )
-
-    print("[+] CSV Exported")
+    df.to_csv(out_path, index=False)
+    log.info("Exported %d companies → %s", len(df), out_path)
+    return out_path

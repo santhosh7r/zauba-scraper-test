@@ -1,419 +1,244 @@
 import time
 import json
+import random
 import hashlib
 import httpx
 
 from bs4 import BeautifulSoup
 
-from database.db import DB, cursor
-
-from utils.address_parser import (
-    extract_state,
-    extract_city
+from config import MIN_DELAY, MAX_DELAY, MAX_RETRIES
+from database.db import (
+    get_unscraped_urls,
+    save_company,
+    mark_scraped,
+    mark_failed,
 )
-
-from crawler.browser_fetch import (
-    browser_manager
-)
+from utils.address_parser import extract_state, extract_city
+from utils.logger import log
 
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64)"
-    )
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
 }
 
 
-def is_blocked_page(html):
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
-    blocked_keywords = [
+def _is_blocked(html: str) -> bool:
+    """Detect actual Cloudflare Turnstile challenge pages.
 
-        "Just a moment",
-        "Checking your browser",
-        "Enable JavaScript",
-        "Cloudflare"
-    ]
-
-    for keyword in blocked_keywords:
-
-        if keyword.lower() in html.lower():
-            return True
-
-    return False
-
-
-def extract_table_value(soup, label):
-
-    rows = soup.find_all("tr")
-
-    for row in rows:
-
-        cols = row.find_all("td")
-
-        if len(cols) < 2:
-            continue
-
-        key = cols[0].get_text(
-            strip=True
-        )
-
-        value = cols[1].get_text(
-            strip=True
-        )
-
-        if label.lower() in key.lower():
-
-            return value
-
-    return None
+    NOTE: Zauba legitimate pages contain 'cloudflare-static/email-decode.min.js'
+    so bare 'cloudflare' is a false positive. Use specific CF challenge phrases.
+    """
+    lower = html.lower()
+    return any(k in lower for k in [
+        "just a moment",
+        "checking your browser",
+        "enable javascript and cookies",    # exact CF Turnstile phrase
+        "performing security verification",  # CF Managed Challenge phrase
+        "challenges.cloudflare.com",         # CF Turnstile script URL
+        "cf-chl-widget",                    # CF challenge widget element
+    ])
 
 
-def extract_json_ld(soup):
-
-    scripts = soup.find_all(
-        "script",
-        type="application/ld+json"
-    )
-
-    for script in scripts:
-
+def _extract_json_ld(soup: BeautifulSoup) -> dict:
+    for script in soup.find_all("script", type="application/ld+json"):
         try:
-
-            data = json.loads(
-                script.string
-            )
-
+            data = json.loads(script.string or "")
             if isinstance(data, dict):
-
                 return data
-
-        except:
+        except (json.JSONDecodeError, TypeError):
             continue
-
     return {}
 
 
-def generate_hash(data):
+def _extract_table_value(soup: BeautifulSoup, label: str) -> str | None:
+    for row in soup.find_all("tr"):
+        cols = row.find_all("td")
+        if len(cols) < 2:
+            continue
+        key = cols[0].get_text(strip=True)
+        if label.lower() in key.lower():
+            return cols[1].get_text(strip=True) or None
+    return None
 
-    return hashlib.md5(
-        str(data).encode()
-    ).hexdigest()
+
+def _generate_hash(data: dict) -> str:
+    payload = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(payload.encode()).hexdigest()
 
 
-def save_company(data):
+# ─── HTTP fetcher ─────────────────────────────────────────────────────────────
 
-    try:
-
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO companies(
-
-                cin,
-                company_name,
-                status,
-                roc,
-                company_type,
-                incorporation_date,
-                email,
-                website,
-                address,
-                state,
-                city,
-                authorized_capital,
-                paid_up_capital,
-                company_category,
-                company_subcategory,
-                source_url,
-                content_hash
-
+def _fetch(url: str) -> str:
+    """Fetch URL with httpx, retry on failure."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = httpx.get(
+                url,
+                headers=HEADERS,
+                timeout=30,
+                follow_redirects=True
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                data["cin"],
-                data["company_name"],
-                data["status"],
-                data["roc"],
-                data["company_type"],
-                data["incorporation_date"],
-                data["email"],
-                data["website"],
-                data["address"],
-                data["state"],
-                data["city"],
-                data["authorized_capital"],
-                data["paid_up_capital"],
-                data["company_category"],
-                data["company_subcategory"],
-                data["source_url"],
-                data["content_hash"]
-            )
-        )
+            html = r.text
 
-        DB.commit()
+            if _is_blocked(html):
+                log.warning(
+                    "Cloudflare block on attempt %d/%d for %s",
+                    attempt, MAX_RETRIES, url
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(5 * attempt + random.uniform(0, 3))
+                continue
 
-    except Exception as e:
+            return html
 
-        print(e)
+        except Exception as exc:
+            log.warning("HTTP error attempt %d/%d for %s: %s", attempt, MAX_RETRIES, url, exc)
+            if attempt < MAX_RETRIES:
+                time.sleep(3 * attempt)
+
+    return ""
 
 
-def scrape_company(url):
+# ─── Parser ───────────────────────────────────────────────────────────────────
 
-    print(f"\n[+] Scraping {url}")
+def _parse_company_page(html: str, url: str) -> dict | None:
+    soup = BeautifulSoup(html, "lxml")
+    json_ld = _extract_json_ld(soup)
 
-    try:
-
-        response = httpx.get(
-            url,
-            headers=HEADERS,
-            timeout=60,
-            follow_redirects=True
-        )
-
-        html = response.text
-
-    except Exception as e:
-
-        print(f"[HTTP Error] {e}")
-
-        return
-
-    if is_blocked_page(html):
-
-        print("[!] Cloudflare detected")
-        print("[!] Switching to browser mode")
-
-        html = browser_manager.fetch(url)
-
-    if not html:
-
-        print("[!] Empty HTML")
-
-        return
-
-    if is_blocked_page(html):
-
-        print("[!] Still blocked")
-
-        with open(
-            "raw_html/blocked_page.html",
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(html)
-
-        return
-
-    with open(
-        "raw_html/company_page.html",
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        f.write(html)
-
-    soup = BeautifulSoup(
-        html,
-        "lxml"
-    )
-
-    json_ld = extract_json_ld(soup)
-
-    cin = (
-        json_ld.get("identifier", {})
-        .get("value")
-    )
-
-    company_name = (
-        json_ld.get("name")
-    )
-
-    email = (
-        json_ld.get("email")
-    )
-
-    address = (
-        json_ld.get("address")
-    )
-
-    website = (
-        json_ld.get("url")
-    )
-
-    incorporation_date = (
-        json_ld.get("foundingDate")
-    )
-
-    status = extract_table_value(
-        soup,
-        "Status"
-    )
-
-    roc = extract_table_value(
-        soup,
-        "ROC"
-    )
-
-    company_type = (
-        extract_table_value(
-            soup,
-            "Principal Business"
-        )
-    )
-
-    authorized_capital = (
-        extract_table_value(
-            soup,
-            "Authorized Capital"
-        )
-    )
-
-    paid_up_capital = (
-        extract_table_value(
-            soup,
-            "Paid up capital"
-        )
-    )
-
-    company_category = (
-        extract_table_value(
-            soup,
-            "Company Category"
-        )
-    )
-
-    company_subcategory = (
-        extract_table_value(
-            soup,
-            "Company Subcategory"
-        )
-    )
+    cin              = (json_ld.get("identifier") or {}).get("value")
+    company_name     = json_ld.get("legalName") or json_ld.get("name")
+    email            = json_ld.get("email")
+    address          = json_ld.get("address")
+    website          = json_ld.get("url")
+    incorporation_date = json_ld.get("foundingDate")
 
     if not company_name:
-
-        title = soup.find("title")
-
-        if title:
-
+        title_tag = soup.find("title")
+        if title_tag:
             company_name = (
-                title.text
-                .replace(
-                    "| ZaubaCorp",
-                    ""
-                )
+                title_tag.text
+                .replace("| ZaubaCorp", "")
+                .replace("| Zauba Corp", "")
                 .strip()
             )
 
-    if (
-        not company_name
-        or
-        "just a moment" in company_name.lower()
-    ):
+    if not company_name or "just a moment" in company_name.lower():
+        log.warning("Could not extract company name from %s", url)
+        return None
 
-        print("[!] Invalid page")
-
-        with open(
-            "raw_html/failed_page.html",
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(html)
-
-        return
+    status              = _extract_table_value(soup, "Company Status")
+    roc                 = (_extract_table_value(soup, "Registrar of Companies") or
+                           _extract_table_value(soup, "ROC"))
+    company_type        = (_extract_table_value(soup, "Company Type") or
+                           _extract_table_value(soup, "Principal Business"))
+    authorized_capital  = _extract_table_value(soup, "Authorized Capital")
+    paid_up_capital     = (_extract_table_value(soup, "Paid up capital") or
+                           _extract_table_value(soup, "Paid Up Capital"))
+    company_category    = _extract_table_value(soup, "Company Category")
+    company_subcategory = (_extract_table_value(soup, "Company Sub Category") or
+                           _extract_table_value(soup, "Company Subcategory"))
 
     state = extract_state(address)
-
-    city = extract_city(address)
+    city  = extract_city(address)
 
     data = {
-
-        "cin": cin,
-
-        "company_name": company_name,
-
-        "status": status,
-
-        "roc": roc,
-
-        "company_type": company_type,
-
-        "incorporation_date": incorporation_date,
-
-        "email": email,
-
-        "website": website,
-
-        "address": address,
-
-        "state": state,
-
-        "city": city,
-
-        "authorized_capital": authorized_capital,
-
-        "paid_up_capital": paid_up_capital,
-
-        "company_category": company_category,
-
+        "cin":                 cin,
+        "company_name":        company_name,
+        "status":              status,
+        "roc":                 roc,
+        "company_type":        company_type,
+        "incorporation_date":  incorporation_date,
+        "email":               email,
+        "website":             website,
+        "address":             address,
+        "state":               state,
+        "city":                city,
+        "authorized_capital":  authorized_capital,
+        "paid_up_capital":     paid_up_capital,
+        "company_category":    company_category,
         "company_subcategory": company_subcategory,
-
-        "source_url": url
+        "source_url":          url,
     }
+    data["content_hash"] = _generate_hash(data)
+    return data
 
-    data["content_hash"] = generate_hash(data)
 
-    print("\n========== EXTRACTED DATA ==========")
+# ─── Scraper ─────────────────────────────────────────────────────────────────
 
-    for k, v in data.items():
+def scrape_company(url: str) -> bool:
+    log.info("Scraping: %s", url)
 
-        print(f"{k}: {v}")
+    html = _fetch(url)
 
-    print("===================================\n")
+    if not html:
+        log.error("Failed to fetch %s", url)
+        mark_failed(url)
+        return False
+
+    if _is_blocked(html):
+        log.error("Permanently blocked for %s", url)
+        mark_failed(url)
+        return False
+
+    data = _parse_company_page(html, url)
+
+    if data is None:
+        mark_failed(url)
+        return False
 
     save_company(data)
+    mark_scraped(url)
 
-    cursor.execute(
-        """
-        UPDATE company_urls
-        SET scraped = 1
-        WHERE url = ?
-        """,
-        (url,)
+    log.info(
+        "✓ %s | CIN: %s | %s, %s",
+        data["company_name"], data["cin"], data["city"], data["state"]
     )
-
-    DB.commit()
-
-    print(
-        f"[+] Saved {company_name}"
-    )
+    return True
 
 
-def start_scraping(limit=100):
+def start_scraping(limit: int = 100) -> dict:
+    urls = get_unscraped_urls(limit)
 
-    browser_manager.start()
+    if not urls:
+        log.info("No unscraped URLs in database")
+        return {"total": 0, "success": 0, "failed": 0}
 
-    urls = cursor.execute(
-        """
-        SELECT url
-        FROM company_urls
-        WHERE scraped = 0
-        LIMIT ?
-        """,
-        (limit,)
-    ).fetchall()
+    log.info("Starting scraping — %d URLs queued", len(urls))
+    success = failed = 0
 
-    for row in urls:
-
+    for i, url in enumerate(urls, start=1):
+        log.info("[%d/%d]", i, len(urls))
         try:
+            ok = scrape_company(url)
+            if ok:
+                success += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            log.error("Unhandled error for %s: %s", url, exc)
+            mark_failed(url)
+            failed += 1
 
-            scrape_company(row[0])
+        delay = random.uniform(MIN_DELAY, MAX_DELAY)
+        time.sleep(delay)
 
-            time.sleep(3)
-
-        except Exception as e:
-
-            print(e)
-
-    browser_manager.close()
+    stats = {"total": len(urls), "success": success, "failed": failed}
+    log.info(
+        "Done — total: %d | success: %d | failed: %d",
+        stats["total"], stats["success"], stats["failed"]
+    )
+    return stats

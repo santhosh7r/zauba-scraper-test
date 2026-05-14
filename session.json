@@ -1,0 +1,47 @@
+{
+  "cookies": [
+    {
+      "name": "ZCSESSID",
+      "value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1dWlkIjoiIiwiYW5vbnltb3VzX3V1aWQiOiJlY2QyYTc4NS1lY2VjLTQzMzUtYmJjOS1mY2E2YTA3MjUyN2MiLCJleHAiOjE3NzkzNDU4ODR9.bEJ8sOaSYl9XM9I4mRuBKD0hlwjLmyfLHqVcWP_WXqo",
+      "domain": ".zaubacorp.com",
+      "path": "/",
+      "expires": 1813301085.02902,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "_ga_VVR3BV80B8",
+      "value": "GS2.1.s1778741086$o1$g0$t1778741086$j60$l0$h0",
+      "domain": ".zaubacorp.com",
+      "path": "/",
+      "expires": 1813301086.512302,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "_ga",
+      "value": "GA1.1.1140039158.1778741086",
+      "domain": ".zaubacorp.com",
+      "path": "/",
+      "expires": 1813301086.513161,
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "cf_clearance",
+      "value": "Spgb6utf7Nc8BnS4Y2DvDqUtEgrvM3a2I64emmIpnnY-1778741087-1.2.1.1-vmlxlPflQo4x19TozPb4d_Q6CPv6r7k2ewe9fsIwFqSmEBaQUwSJbfZ.1NwFt8ZYe9hBPCMVCrFRFXrdzfOGoTs8VcOPJed5RlnPMMrz28BTMJs__vTG7oMBMe.n_74c79qximfYnjPZ2kkYU_eVuZwP2cCNleR3YlcHQWSl3hkFhIWjyFEbTEL7l5WDo5I0D_g9Nzfz5Fu0ib49XIlm3jzA2GMlujr1XbTNz8Jk3RxCVyw9NDSnXDhyLUsn9aEI.Upy30R08EoefI5MJcvIg9v6QlPBDr.rUtUbGjkGVg4.cR_vJrUcFBe2ZleCimx4bNZ1Klc8mzOGJgLm4s5THw",
+      "domain": ".zaubacorp.com",
+      "path": "/",
+      "expires": 1810277087.102379,
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "None",
+      "partitionKey": "https://zaubacorp.com",
+      "_crHasCrossSiteAncestor": false
+    }
+  ],
+  "origins": []
+}

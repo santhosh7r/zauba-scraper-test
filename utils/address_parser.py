@@ -1,61 +1,96 @@
-INDIAN_STATES = [
+import re
 
-    "Andhra Pradesh",
-    "Arunachal Pradesh",
-    "Assam",
-    "Bihar",
-    "Chhattisgarh",
-    "Goa",
-    "Gujarat",
-    "Haryana",
-    "Himachal Pradesh",
-    "Jharkhand",
-    "Karnataka",
-    "Kerala",
-    "Madhya Pradesh",
-    "Maharashtra",
-    "Manipur",
-    "Meghalaya",
-    "Mizoram",
-    "Nagaland",
-    "Odisha",
-    "Punjab",
-    "Rajasthan",
-    "Sikkim",
-    "Tamil Nadu",
-    "Telangana",
-    "Tripura",
-    "Uttar Pradesh",
-    "Uttarakhand",
-    "West Bengal",
-    "Delhi"
+# ─── Indian states + UTs ─────────────────────────────────────────────────────
+
+INDIAN_STATES = [
+    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar",
+    "Chhattisgarh", "Goa", "Gujarat", "Haryana",
+    "Himachal Pradesh", "Jharkhand", "Karnataka", "Kerala",
+    "Madhya Pradesh", "Maharashtra", "Manipur", "Meghalaya",
+    "Mizoram", "Nagaland", "Odisha", "Punjab", "Rajasthan",
+    "Sikkim", "Tamil Nadu", "Telangana", "Tripura",
+    "Uttar Pradesh", "Uttarakhand", "West Bengal",
+    # Union territories
+    "Delhi", "Jammu and Kashmir", "Ladakh",
+    "Chandigarh", "Puducherry", "Lakshadweep",
+    "Dadra and Nagar Haveli", "Daman and Diu",
+    "Andaman and Nicobar",
 ]
 
+# Two-letter MCA state codes → full name
+_STATE_CODE_MAP = {
+    "DL": "Delhi",   "MH": "Maharashtra", "TN": "Tamil Nadu",
+    "KA": "Karnataka", "GJ": "Gujarat",   "RJ": "Rajasthan",
+    "UP": "Uttar Pradesh", "WB": "West Bengal", "TG": "Telangana",
+    "AP": "Andhra Pradesh", "KL": "Kerala",   "MP": "Madhya Pradesh",
+    "HR": "Haryana",  "PB": "Punjab",      "BR": "Bihar",
+    "OR": "Odisha",   "AS": "Assam",       "JH": "Jharkhand",
+    "HP": "Himachal Pradesh", "CG": "Chhattisgarh", "UK": "Uttarakhand",
+    "GA": "Goa",      "MN": "Manipur",     "ML": "Meghalaya",
+    "MZ": "Mizoram",  "NL": "Nagaland",    "SK": "Sikkim",
+    "TR": "Tripura",  "AR": "Arunachal Pradesh",
+    "JK": "Jammu and Kashmir", "LA": "Ladakh",
+    "CH": "Chandigarh", "PY": "Puducherry",
+    "AN": "Andaman and Nicobar",
+}
 
-def extract_state(address):
+# Pincode pattern: 6-digit Indian postal code
+_PINCODE_RE = re.compile(r"\b(\d{6})\b")
 
+
+def extract_state(address: str | None) -> str | None:
+    """Extract Indian state name from address string."""
     if not address:
         return None
 
-    address = address.lower()
+    # 1. Try two-letter state code just before pincode or country ("IN")
+    #    e.g. "New Delhi DL 110030 IN"
+    for code, name in _STATE_CODE_MAP.items():
+        if re.search(rf"\b{code}\b", address):
+            return name
 
-    for state in INDIAN_STATES:
-
-        if state.lower() in address:
-
+    # 2. Try full state name (case-insensitive)
+    lower = address.lower()
+    for state in sorted(INDIAN_STATES, key=len, reverse=True):
+        if state.lower() in lower:
             return state
 
     return None
 
 
-def extract_city(address):
+def extract_city(address: str | None) -> str | None:
+    """Extract city name from address string.
 
+    Zauba addresses typically look like:
+      "<street>, <locality>, <city> <STATE_CODE> <PIN> IN"
+    We look for the word just before the 2-letter state code.
+    """
     if not address:
         return None
 
-    parts = address.split()
+    parts = address.strip().split()
 
-    if len(parts) < 2:
-        return None
+    # Find the position of a 2-letter state code
+    for i, part in enumerate(parts):
+        if part.upper() in _STATE_CODE_MAP and i > 0:
+            # The word(s) before the state code are the city
+            # Collect consecutive title-case words immediately before code
+            city_parts = []
+            j = i - 1
+            while j >= 0 and (parts[j][0].isupper() or parts[j].istitle()):
+                city_parts.insert(0, parts[j])
+                j -= 1
+                if len(city_parts) >= 3:
+                    break
+            if city_parts:
+                return " ".join(city_parts)
 
-    return parts[-4] if len(parts) >= 4 else None
+    # Fallback: word before 6-digit pincode
+    match = _PINCODE_RE.search(address)
+    if match:
+        idx = address.find(match.group())
+        before = address[:idx].strip().split()
+        if before:
+            return before[-1]
+
+    return None
