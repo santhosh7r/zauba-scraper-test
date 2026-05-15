@@ -2,20 +2,22 @@
 crawler/detail_scraper.py — company detail extraction
 ======================================================
 Fetches a company's ZaubaCorp page, extracts structured data (JSON-LD first,
-HTML-table fallback), validates it, and stores it in Supabase. Every company is
-stored — there is no incorporation-date filtering — because the age-A bucket is
-already the newest data the site has.
+HTML-table fallback), validates it, filters to the last 30 days, and stores
+it in Supabase.
+
+Uses detail-appropriate delays (8–20 s) between page fetches.
+Retries failed pages up to MAX_RETRIES times with increasing cooldowns.
 """
 
 import json
 import random
 import hashlib
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 from bs4 import BeautifulSoup
 
-from config import MIN_DELAY, MAX_DELAY
+from config import DETAIL_MIN_DELAY, DETAIL_MAX_DELAY, MAX_RETRIES, ONLY_LAST_30_DAYS, RETRY_DELAYS
 from crawler.fetch import fetch_html, is_blocked
 from database.db import mark_stored, mark_failed, url_already_processed
 from database.supabase_client import upsert_company_to_supabase
@@ -105,6 +107,14 @@ def _parse_date(raw: str | None) -> date | None:
     return None
 
 
+def _is_within_last_30_days(inc_date: date | None) -> bool:
+    """Return True if *inc_date* falls within the last 30 calendar days."""
+    if inc_date is None:
+        return False
+    cutoff = date.today() - timedelta(days=30)
+    return inc_date >= cutoff
+
+
 # ─── Parser ───────────────────────────────────────────────────────────────────
 
 def _parse_company_page(html: str, url: str) -> dict | None:
@@ -139,7 +149,7 @@ def _parse_company_page(html: str, url: str) -> dict | None:
             )
 
     if not company_name or "just a moment" in company_name.lower():
-        log.warning("Could not extract company name from %s", url)
+        log.warning("[Detail] Could not extract company name from %s", url)
         return None
 
     if not cin:
@@ -190,22 +200,23 @@ def _parse_company_page(html: str, url: str) -> dict | None:
         "company_subcategory": company_subcategory,
         "source_url":          url,
     }
+    data["_inc_date_obj"] = inc_date   # keep for 30-day filter (stripped before storage)
     data["content_hash"] = _generate_hash(data)
     return data
 
 
 def _validate(data: dict) -> bool:
     if not data.get("cin"):
-        log.warning("Validation failed: CIN missing for %s", data.get("source_url"))
+        log.warning("[Detail] Validation failed: CIN missing for %s", data.get("source_url"))
         return False
     if not data.get("company_name"):
-        log.warning("Validation failed: company_name missing")
+        log.warning("[Detail] Validation failed: company_name missing")
         return False
     name = data["company_name"].lower()
     for phrase in ("just a moment", "search results", "cloudflare",
                    "checking your browser"):
         if phrase in name:
-            log.warning("Validation failed: invalid phrase in company name")
+            log.warning("[Detail] Validation failed: invalid phrase in company name")
             return False
     return True
 
@@ -215,54 +226,94 @@ def _validate(data: dict) -> bool:
 def scrape_company(url: str) -> str:
     """Scrape and store a single company URL.
 
-    Returns one of: 'stored', 'failed', 'skipped'."""
+    Returns one of: 'stored', 'failed', 'skipped', 'too_old'.
+    Retries up to MAX_RETRIES times with increasing cooldowns."""
     if url_already_processed(url):
         return "skipped"
 
-    log.info("Scraping: %s", url)
-    html = fetch_html(url, "detail")
+    log.info("[Detail] Scraping: %s", url)
+
+    html = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        html = fetch_html(url, "detail", page_type="detail")
+        if html and not is_blocked(html):
+            break
+        delay_idx = min(attempt - 1, len(RETRY_DELAYS) - 1)
+        delay = RETRY_DELAYS[delay_idx] + random.uniform(0, 5)
+        log.warning(
+            "[Detail] 🔒 Blocked/empty on attempt %d/%d for %s — "
+            "retrying in %.1fs",
+            attempt, MAX_RETRIES, url, delay,
+        )
+        if attempt < MAX_RETRIES:
+            time.sleep(delay)
+
     if not html or is_blocked(html):
-        log.error("Failed to fetch %s", url)
+        log.error("[Detail] ✗ Failed to fetch %s after %d attempts", url, MAX_RETRIES)
         mark_failed(url)
         return "failed"
 
     data = _parse_company_page(html, url)
     if data is None or not _validate(data):
-        log.error("Validation failed for %s", url)
+        log.error("[Detail] Validation failed for %s", url)
         mark_failed(url)
         return "failed"
+
+    # 30-day filter — skip companies incorporated more than 30 days ago.
+    if ONLY_LAST_30_DAYS:
+        inc_date = data.pop("_inc_date_obj", None)
+        if not _is_within_last_30_days(inc_date):
+            log.info(
+                "[Detail] ⏭  Skipping %s (incorporated %s — older than 30 days)",
+                data.get("company_name"), data.get("incorporation_date"),
+            )
+            # Mark as processed so we don't revisit it every sweep.
+            mark_stored(url, data["cin"], data.get("incorporation_date"),
+                        data["content_hash"])
+            return "too_old"
+    else:
+        data.pop("_inc_date_obj", None)
 
     if upsert_company_to_supabase(data):
         mark_stored(url, data["cin"], data["incorporation_date"],
                     data["content_hash"])
         log.info(
-            "✓ Stored %s | CIN: %s | inc: %s | %s, %s",
+            "[Detail] ✓ Stored %s | CIN: %s | inc: %s | %s, %s",
             data["company_name"], data["cin"], data["incorporation_date"],
             data["city"], data["state"],
         )
         return "stored"
 
-    log.warning("Failed to sync %s to Supabase — will retry next sweep", url)
+    log.warning("[Detail] Failed to sync %s to Supabase — will retry next sweep", url)
     mark_failed(url)
     return "failed"
 
 
 def scrape_urls(urls: list[str]) -> dict:
-    """Scrape a batch of URLs. A failure on one URL never stops the batch."""
-    stats = {"stored": 0, "failed": 0, "skipped": 0}
+    """Scrape a batch of URLs. A failure on one URL never stops the batch.
+
+    Randomised human-like delays (8–20 s) are applied between non-skipped pages;
+    the browser_fetch module applies an additional post-fetch delay internally."""
+    stats = {"stored": 0, "failed": 0, "skipped": 0, "too_old": 0}
+
     for i, url in enumerate(urls, start=1):
         try:
             outcome = scrape_company(url)
         except Exception as exc:
-            log.error("Unhandled error for %s: %s", url, exc)
+            log.error("[Detail] Unhandled error for %s: %s", url, exc)
             try:
                 mark_failed(url)
             except Exception:
                 pass
             outcome = "failed"
-        stats[outcome] = stats.get(outcome, 0) + 1
-        log.debug("[%d/%d] %s → %s", i, len(urls), url, outcome)
 
-        if outcome != "skipped":
-            time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+        stats[outcome] = stats.get(outcome, 0) + 1
+        log.debug("[Detail] [%d/%d] %s → %s", i, len(urls), url, outcome)
+
+        # Extra inter-request delay for non-skipped pages to pace scraping.
+        if outcome not in ("skipped", "too_old"):
+            extra = random.uniform(DETAIL_MIN_DELAY, DETAIL_MAX_DELAY)
+            log.debug("[Detail] Sleeping %.1fs before next URL", extra)
+            time.sleep(extra)
+
     return stats

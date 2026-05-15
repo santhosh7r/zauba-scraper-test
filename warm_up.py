@@ -2,88 +2,143 @@
 """
 warm_up.py — Human-assisted Cloudflare Turnstile solver
 =========================================================
-Run this ONCE before running the bot. It will:
-  1. Open a real visible browser using a persistent profile directory
-  2. Navigate to zaubacorp.com
-  3. Wait for YOU to solve the Cloudflare challenge (or wait for auto-pass)
-  4. Save the FULL browser state (cookies + localStorage + fingerprint data)
-     to the ./browser_profile/ directory
-  5. The bot reuses this profile for all future scraping
+Run this ONCE before starting the bot on a fresh VPS (or after being blocked).
+It will:
+  1. Open a real, fully visible Chrome browser using the persistent profile
+     directory (./browser_profile/) so any previously saved cookies are loaded.
+  2. Navigate to zaubacorp.com.
+  3. Wait for YOU to solve the Cloudflare challenge (or wait for auto-pass).
+  4. After you press ENTER, save the FULL browser state (cookies, localStorage,
+     IndexedDB, cache, fingerprint data) permanently to ./browser_profile/.
+  5. The bot reuses this profile for all future scraping sessions, so
+     Cloudflare sees a returning user rather than a fresh browser.
 
 Usage:
     python warm_up.py
+
+After running this, start the bot with:
+    python bot.py
 """
 
+import sys
 from pathlib import Path
+
 from playwright.sync_api import sync_playwright
 
+from config import BROWSER_ARGS, get_random_user_agent, get_random_viewport
+
 PROFILE_DIR = Path(__file__).parent / "browser_profile"
-TARGET_URL   = "https://www.zaubacorp.com"
+TARGET_URL  = "https://www.zaubacorp.com"
+
+
+def _banner(title: str):
+    print()
+    print("=" * 64)
+    print(f"  {title}")
+    print("=" * 64)
 
 
 def run_warmup():
-    print("=" * 60)
-    print("  Zauba Scraper — Cloudflare Warm-Up Tool")
-    print("=" * 60)
+    _banner("Zauba Scraper — Cloudflare Warm-Up Tool")
     print()
-    print("A browser window will open. Please:")
-    print("  1. Wait for Cloudflare to verify you (auto or checkbox)")
-    print("  2. Once you see the Zauba homepage, press ENTER here")
+    print("This will open a real Chrome browser window.")
     print()
-    input("Press ENTER to open the browser...")
+    print("What to do:")
+    print("  1. Look at the browser window that opens.")
+    print("  2. If you see a Cloudflare challenge, solve it (click the")
+    print("     checkbox, complete the CAPTCHA, or just wait for auto-pass).")
+    print("  3. Once the Zauba homepage is fully visible, come back here")
+    print("     and press ENTER.")
+    print()
+
+    try:
+        input("Press ENTER to open the browser (Ctrl+C to cancel)...")
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(0)
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    ua       = get_random_user_agent()
+    viewport = get_random_viewport()
+
+    print(f"\n[+] Profile directory : {PROFILE_DIR}")
+    print(f"[+] Viewport          : {viewport['width']}×{viewport['height']}")
+    print(f"[+] User-Agent        : {ua[:60]}...")
+    print()
 
     with sync_playwright() as p:
         # launch_persistent_context = full Chrome profile (cookies + localStorage + all)
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
-            headless=False,
-            slow_mo=100,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--window-size=1280,800",
+            headless=False,      # Must be visible for human interaction
+            slow_mo=80,
+            args=BROWSER_ARGS + [
+                f"--window-size={viewport['width']},{viewport['height']}",
                 "--start-maximized",
             ],
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            viewport=viewport,
+            user_agent=ua,
             locale="en-US",
             timezone_id="Asia/Kolkata",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
 
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+        # Patch automation fingerprints before any page loads.
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        """)
 
         page = context.new_page()
 
-        print(f"\n[+] Navigating to {TARGET_URL} ...")
-        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=90_000)
+        print(f"[+] Navigating to {TARGET_URL} ...")
+        try:
+            page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=120_000)
+        except Exception as exc:
+            print(f"[!] Navigation warning (browser may still be open): {exc}")
 
         print()
-        print("=" * 60)
-        print("  Solve the Cloudflare challenge in the browser window.")
-        print("  Once the Zauba homepage loads fully, press ENTER below.")
-        print("=" * 60)
-        input("\nPress ENTER after Zauba homepage is visible...")
+        _banner("ACTION REQUIRED")
+        print()
+        print("  The browser is now open. If you see a Cloudflare challenge:")
+        print("    ✓ Tick the checkbox  OR")
+        print("    ✓ Wait for it to pass automatically")
+        print()
+        print("  Once the ZAUBA HOMEPAGE is fully visible, press ENTER below.")
+        print()
 
-        # Persist state — browser_profile dir now has everything
+        try:
+            input("Press ENTER after the Zauba homepage is visible...")
+        except KeyboardInterrupt:
+            print("\n[!] Interrupted — closing browser without saving full session.")
+            context.close()
+            sys.exit(1)
+
+        # Closing the persistent context flushes cookies/localStorage to disk.
+        print("\n[+] Saving session to disk...")
         context.close()
 
-    print(f"\n[✓] Browser profile saved to: {PROFILE_DIR}")
+    _banner("Warm-Up Complete!")
     print()
-    print("=" * 60)
-    print("  Warm-up complete! Now run the bot:")
-    print("  python bot.py --scrape --limit 500")
+    print(f"  ✓ Profile saved to: {PROFILE_DIR}")
     print()
-    print("  TIP: If blocked again later, just re-run this warm-up.")
-    print("=" * 60)
+    print("  You can now start the bot:")
+    print("    python bot.py")
+    print()
+    print("  TIP: If blocked again later, just re-run this warm-up:")
+    print("    python warm_up.py")
+    print()
+    print("  TIP: To rotate the profile entirely (fresh start):")
+    print(f"    rm -rf {PROFILE_DIR} && python warm_up.py")
+    print("=" * 64)
+    print()
 
 
 if __name__ == "__main__":

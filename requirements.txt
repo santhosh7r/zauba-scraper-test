@@ -1,9 +1,22 @@
-beautifulsoup4==4.14.3
-greenlet==3.5.0
+# Zauba scraper — Python dependencies.
+# Install with:  pip install -r requirements.txt
+# Tested on Python 3.11–3.14.
+
+# HTTP + HTML parsing
 httpx==0.28.1
+beautifulsoup4==4.14.3
 lxml==6.0.1
-pandas==3.0.3
+
+# Browser fallback for Cloudflare-blocked pages
 playwright==1.59.0
 playwright-stealth==2.0.3
-pyee==13.0.1
-python-dotenv>=1.0.0
+
+# Virtual display (Xvfb wrapper) so the headless=False browser can run on a
+# screenless VPS. Needs the `xvfb` system package too — install.sh handles it.
+pyvirtualdisplay==3.0
+
+# Config
+python-dotenv==1.2.2
+
+# CSV export tool (utils/export_csv.py) — not needed by the bot itself
+pandas==3.0.3
