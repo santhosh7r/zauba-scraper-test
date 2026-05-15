@@ -1,119 +1,143 @@
 #!/usr/bin/env python3
 """
-Zauba Corp Scraper Bot
-======================
-Scrapes Indian company data from zaubacorp.com using plain HTTP (httpx).
-No browser needed — the site is accessible without Playwright.
+Zauba Corp Continuous Scraper
+=============================
+Continuously scrapes the *newest* companies on zaubacorp.com — the ``age-A``
+bucket, which is the youngest companies the site indexes — and stores every one
+in Supabase (deduplicated by CIN). Downstream, query the data ordered by
+``incorporation_date DESC`` to read it newest → oldest.
 
-Usage examples:
-  # Full run (discover + scrape + export)
-  python bot.py
+The bot is built to run unattended on a VPS forever:
+  * every error is caught and recovered from with exponential backoff,
+  * Cloudflare blocks trigger a cooldown instead of a crash,
+  * each sweep walks every listing page; finished URLs are skipped,
+  * when a full sweep ends it pauses, then sweeps again to pick up
+    newly-added companies.
 
-  # Discover only (pages 1-20)
-  python bot.py --discover --start-page 1 --end-page 20
-
-  # Scrape already-discovered URLs (up to 500)
-  python bot.py --scrape --limit 500
-
-  # Export DB to CSV only
-  python bot.py --export
-
-  # Scrape a single URL for testing
-  python bot.py --test-url https://www.zaubacorp.com/PACIFIC-INFRABUILD-LLP-AAE-6126
+Usage:
+  python bot.py            # run forever (default)
+  python bot.py --once     # run a single sweep, then exit (for testing)
 """
 
 import argparse
-import sys
+import random
+import time
 
-from database.db import initialize_database
-from crawler.discover import start_discovery
-from crawler.detail_scraper import scrape_company, start_scraping
-from utils.export_csv import export_companies
+from config import (
+    ERROR_BACKOFF_MAX_SECONDS,
+    ERROR_BACKOFF_SECONDS,
+    MAX_DELAY,
+    MIN_DELAY,
+    SWEEP_PAUSE_SECONDS,
+)
+from crawler.discover import crawl_listing_page, get_total_pages
+from crawler.detail_scraper import scrape_urls
+from database.db import initialize_database, queue_stats
 from utils.logger import log
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="bot.py",
-        description="Zauba Corp company data scraper",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        description="Zauba Corp continuous latest-company scraper",
     )
-
-    mode = p.add_argument_group("Mode (default: run all steps)")
-    mode.add_argument("--discover", action="store_true",
-                      help="Only run the URL discovery phase")
-    mode.add_argument("--scrape", action="store_true",
-                      help="Only run the detail scraping phase")
-    mode.add_argument("--export", action="store_true",
-                      help="Only export the DB to CSV")
-    mode.add_argument("--test-url", metavar="URL",
-                      help="Scrape a single URL and print results (for testing)")
-
-    disc = p.add_argument_group("Discovery options")
-    disc.add_argument("--start-page", type=int, default=1,
-                      help="First listing page to crawl (default: 1)")
-    disc.add_argument("--end-page", type=int, default=5,
-                      help="Last listing page to crawl (default: 5)")
-
-    scrp = p.add_argument_group("Scraping options")
-    scrp.add_argument("--limit", type=int, default=100,
-                      help="Max companies to scrape per run (default: 100)")
-
+    p.add_argument(
+        "--once", action="store_true",
+        help="Run a single sweep and exit (default: run forever)",
+    )
     return p
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
+def run_sweep() -> dict:
+    """Walk every listing page in the age bucket, scraping each page's URLs.
 
-    log.info("=" * 60)
-    log.info("Zauba Corp Scraper Bot — starting")
-    log.info("=" * 60)
+    A failure on any single page or URL is logged and skipped — the sweep
+    keeps going."""
+    totals = {"stored": 0, "failed": 0, "skipped": 0, "pages": 0}
 
-    initialize_database()
+    total_pages = get_total_pages()
+    if total_pages < 1:
+        raise RuntimeError("Could not determine listing page count (site blocked?)")
+    log.info("Age bucket currently has %d listing pages", total_pages)
 
-    # ── Single URL test ───────────────────────────────────────────
-    if args.test_url:
-        log.info("Test mode: scraping single URL")
-        ok = scrape_company(args.test_url)
-        if ok:
-            log.info("Test scrape succeeded")
-        else:
-            log.error("Test scrape failed")
-            sys.exit(1)
-        return
+    for page in range(1, total_pages + 1):
+        urls = crawl_listing_page(page)
+        if not urls:
+            log.warning("Listing page %d returned no URLs — skipping.", page)
+            continue
 
-    run_all     = not (args.discover or args.scrape or args.export)
-    run_discover = run_all or args.discover
-    run_scrape   = run_all or args.scrape
-    run_export   = run_all or args.export
+        stats = scrape_urls(urls)
+        for k, v in stats.items():
+            totals[k] = totals.get(k, 0) + v
+        totals["pages"] += 1
 
-    # ── Phase 1: Discovery ────────────────────────────────────────
-    if run_discover:
-        log.info("Phase 1: Discovering URLs (pages %d–%d)",
-                 args.start_page, args.end_page)
-        total = start_discovery(start_page=args.start_page, end_page=args.end_page)
-        log.info("Discovery complete — %d URLs found", total)
-
-    # ── Phase 2: Scraping ─────────────────────────────────────────
-    if run_scrape:
-        log.info("Phase 2: Scraping company details (limit=%d)", args.limit)
-        stats = start_scraping(limit=args.limit)
         log.info(
-            "Scraping complete — success: %d | failed: %d | total: %d",
-            stats["success"], stats["failed"], stats["total"]
+            "Page %d/%d done — stored:%d failed:%d skipped:%d "
+            "| sweep totals stored:%d failed:%d skipped:%d",
+            page, total_pages,
+            stats["stored"], stats["failed"], stats["skipped"],
+            totals["stored"], totals["failed"], totals["skipped"],
         )
 
-    # ── Phase 3: Export ───────────────────────────────────────────
-    if run_export:
-        log.info("Phase 3: Exporting to CSV")
-        csv_path = export_companies()
-        log.info("Saved → %s", csv_path)
+        time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+
+    return totals
+
+
+def main():
+    args = build_parser().parse_args()
 
     log.info("=" * 60)
-    log.info("Bot finished. Check exports/ for CSV and logs/ for full log.")
+    log.info("Zauba Corp continuous scraper starting")
     log.info("=" * 60)
+
+    # The database must exist before anything else; retry until it does.
+    while True:
+        try:
+            initialize_database()
+            break
+        except Exception as exc:
+            log.error("Database init failed: %s — retrying in 30s", exc)
+            time.sleep(30)
+
+    sweep = 1
+    backoff = ERROR_BACKOFF_SECONDS
+
+    while True:
+        try:
+            log.info("--- Sweep #%d starting ---", sweep)
+            totals = run_sweep()
+            qs = queue_stats()
+            log.info(
+                "Sweep #%d complete — pages:%d stored:%d failed:%d skipped:%d "
+                "| queue total:%d synced:%d with-failures:%d",
+                sweep,
+                totals["pages"], totals["stored"], totals["failed"],
+                totals["skipped"],
+                qs["total"], qs["synced"], qs["failed"],
+            )
+
+            if args.once:
+                log.info("--once given — exiting after one sweep.")
+                return
+
+            # A clean sweep means recovery worked; reset the backoff.
+            backoff = ERROR_BACKOFF_SECONDS
+            sweep += 1
+
+            log.info("Pausing %ds before the next sweep...", SWEEP_PAUSE_SECONDS)
+            time.sleep(SWEEP_PAUSE_SECONDS)
+
+        except KeyboardInterrupt:
+            log.info("Bot stopped manually by user.")
+            return
+
+        except Exception as exc:
+            # Catch-all: the bot must never die on a VPS. Log, back off, retry.
+            log.exception("Unhandled error in sweep #%d: %s", sweep, exc)
+            log.info("Recovering automatically — retrying in %ds", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, ERROR_BACKOFF_MAX_SECONDS)
 
 
 if __name__ == "__main__":

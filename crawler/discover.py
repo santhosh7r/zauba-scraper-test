@@ -1,31 +1,19 @@
-import time
-import random
-import httpx
+"""
+crawler/discover.py — listing-page crawler
+===========================================
+Walks the ZaubaCorp *age-A* bucket — the youngest companies the site indexes —
+and records every company URL it finds in the local SQLite queue.
+"""
+
+import re
 
 from bs4 import BeautifulSoup
 
-from config import (
-    BASE_URL,
-    LISTING_BASE,
-    LISTING_PAGE_TEMPLATE,
-    MIN_DELAY,
-    MAX_DELAY,
-    MAX_RETRIES,
-)
+from config import AGE_BUCKET, BASE_URL, LISTING_BASE
+from crawler.fetch import fetch_html, is_blocked
 from database.db import save_company_url
 from utils.logger import log
 
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Connection": "keep-alive",
-}
 
 URL_BLACKLIST = {
     "faq", "privacy-policy", "terms", "contact-us",
@@ -34,22 +22,11 @@ URL_BLACKLIST = {
     "advertise", "feedback", "help",
 }
 
-
-def _is_blocked(html: str) -> bool:
-    """Detect actual Cloudflare Turnstile challenge pages.
-
-    NOTE: Zauba legitimate pages contain 'cloudflare-static/email-decode.min.js'
-    so bare 'cloudflare' is a false positive. Use specific CF challenge phrases.
-    """
-    lower = html.lower()
-    return any(k in lower for k in [
-        "just a moment",
-        "checking your browser",
-        "enable javascript and cookies",
-        "performing security verification",
-        "challenges.cloudflare.com",
-        "cf-chl-widget",
-    ])
+# Matches the bucket's "Last" pagination link, e.g.
+#   /companies-list/age-A/p-496-company.html
+_LAST_PAGE_RE = re.compile(
+    rf"{re.escape(AGE_BUCKET)}/p-(\d+)-company", re.IGNORECASE
+)
 
 
 def _is_company_url(href: str) -> bool:
@@ -66,67 +43,62 @@ def _is_company_url(href: str) -> bool:
     return True
 
 
-def _get_listing_url(page: int) -> str:
-    if page == 1:
-        return LISTING_BASE
-    return LISTING_PAGE_TEMPLATE.format(page=page)
+def listing_url(page: int) -> str:
+    """URL of page *page* within the age bucket."""
+    if page <= 1:
+        return f"{LISTING_BASE}/{AGE_BUCKET}-company.html"
+    return f"{LISTING_BASE}/{AGE_BUCKET}/p-{page}-company.html"
 
 
-def crawl_listing_page(page: int) -> int:
-    url = _get_listing_url(page)
-    log.info("Crawling listing page %d → %s", page, url)
+def get_total_pages() -> int:
+    """Return how many listing pages the age bucket currently has.
 
-    html = ""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = httpx.get(url, headers=HEADERS, timeout=30, follow_redirects=True)
-            html = r.text
-            if not _is_blocked(html):
-                break
-            log.warning("CF block on listing page %d, attempt %d/%d", page, attempt, MAX_RETRIES)
-            time.sleep(5 * attempt)
-        except Exception as exc:
-            log.warning("HTTP error listing page %d attempt %d: %s", page, attempt, exc)
-            time.sleep(3 * attempt)
-
-    if not html or _is_blocked(html):
-        log.error("Failed to load listing page %d", page)
+    Parses the pagination of page 1. Returns 0 if it cannot be determined
+    (e.g. the page was blocked) so the caller can back off and retry."""
+    html = fetch_html(listing_url(1), "listing page-count")
+    if not html or is_blocked(html):
+        log.error("Could not load page 1 to determine total page count.")
         return 0
 
+    pages = [int(m) for m in _LAST_PAGE_RE.findall(html)]
+    if not pages:
+        # Single-page bucket, or pagination markup changed — treat as 1 page.
+        log.warning("No pagination found in age bucket; assuming a single page.")
+        return 1
+    return max(pages)
+
+
+def crawl_listing_page(page: int) -> list[str]:
+    """Fetch one listing page and return the company URLs it contains.
+
+    Every URL is also recorded in the local SQLite queue so we know we've
+    seen it. Returns [] on failure — the caller simply moves on."""
+    url = listing_url(page)
+    log.info("Crawling listing page %d → %s", page, url)
+
+    html = fetch_html(url, f"listing p{page}")
+    if not html or is_blocked(html):
+        log.error("Failed to load listing page %d", page)
+        return []
+
     soup = BeautifulSoup(html, "lxml")
-    links = soup.find_all("a", href=True)
-    log.debug("Found %d total links on page %d", len(links), page)
 
     seen: set[str] = set()
-    discovered = 0
+    urls: list[str] = []
 
-    for tag in links:
+    for tag in soup.find_all("a", href=True):
         href: str = tag["href"].strip()
         if href.startswith("/"):
             href = BASE_URL + href
         if href in seen or not _is_company_url(href):
             continue
         seen.add(href)
-        save_company_url(href, page)
-        log.debug("  [URL] %s", href)
-        discovered += 1
-
-    log.info("Page %d → discovered %d company URLs", page, discovered)
-    return discovered
-
-
-def start_discovery(start_page: int = 1, end_page: int = 5) -> int:
-    total = 0
-    for page in range(start_page, end_page + 1):
         try:
-            count = crawl_listing_page(page)
-            total += count
+            save_company_url(href, page)
         except Exception as exc:
-            log.error("Error on listing page %d: %s", page, exc)
+            # A queue write failing must never abort discovery.
+            log.warning("Could not queue URL %s: %s", href, exc)
+        urls.append(href)
 
-        delay = random.uniform(MIN_DELAY, MAX_DELAY)
-        log.debug("Sleeping %.1fs", delay)
-        time.sleep(delay)
-
-    log.info("Discovery complete — %d URLs found", total)
-    return total
+    log.info("Page %d → %d company URLs", page, len(urls))
+    return urls

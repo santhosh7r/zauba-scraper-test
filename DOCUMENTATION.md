@@ -1,66 +1,124 @@
-# Technical Documentation: Zauba Corp Scraper Bot
+# Technical Documentation: Zauba Corp Continuous Ingestion System
 
 ## 1. Overview
-The Zauba Corp Scraper is a modular, high-performance Python-based bot designed to extract Indian company information from [ZaubaCorp](https://www.zaubacorp.com). It implements a multi-stage pipeline: URL discovery, detailed data extraction, and automated CSV export.
+The Zauba Corp Ingestion Bot is a continuous ingestion system that discovers,
+scrapes, validates, and synchronizes the **newest companies** listed on
+[ZaubaCorp](https://www.zaubacorp.com) into a Supabase PostgreSQL backend. It is
+built to run unattended on a VPS forever and recover from every error on its
+own.
 
 ### Core Technical Stack
-*   **Networking:** `httpx` (Synchronous with advanced header management)
+*   **Networking:** `httpx` (synchronous) with a Playwright browser fallback
 *   **Parsing:** `BeautifulSoup4` (LXML backend)
-*   **Data Storage:** `SQLite3` (Persistent state management)
-*   **Analysis:** `Pandas` (CSV Export generation)
+*   **State Queue:** `SQLite3` (discovery queue, retry tracking, dedup)
+*   **Primary Database:** `Supabase PostgreSQL` (company storage)
+*   **Analysis:** `Pandas` (CSV export)
 
 ---
 
-## 2. System Architecture
+## 2. How "latest companies" works
 
-The project is designed with a modular architecture to ensure separation of concerns:
+ZaubaCorp has **no public "newest companies" page**. Its master list
+(`/companies-list/p-N-company.html`) is sorted by industry code and company
+name — *not* by date — so crawling it returns companies of every age at random.
 
-- **`bot.py`**: Unified CLI interface using `argparse`. Handles execution modes (full, discovery-only, or scraping-only).
-- **`crawler/discover.py`**: Crawls listing pages to find unique company URLs. It filters out non-company links and avoids duplicates using the DB.
-- **`crawler/detail_scraper.py`**: The core extraction engine. It fetches individual company pages and parses structured data.
-- **`database/db.py`**: Manages the SQLite connection and schema. Tracks URL status (`scraped`, `failed`, `page_number`).
-- **`utils/address_parser.py`**: Uses regex and state-code mapping to decompose raw address strings into City and State.
-- **`config.py`**: Centralized settings for timeouts, delays, and HTTP headers.
+Instead, the bot crawls ZaubaCorp's **age bucket `age-A`**, which is the
+*youngest* companies the site indexes:
 
----
+```
+Page 1 : https://www.zaubacorp.com/companies-list/age-A-company.html
+Page N : https://www.zaubacorp.com/companies-list/age-A/p-N-company.html
+```
 
-## 3. Key Technical Features & Fixes
+This bucket is currently ~496 pages (~14,900 companies). It is the freshest
+data ZaubaCorp publishes. Every company in it is scraped and stored — there is
+**no incorporation-date filter** (the old 30-day filter dropped everything,
+because ZaubaCorp has nothing from the last 30 days).
 
-### 🛡️ Advanced Anti-Detection
-The project moved from heavy Playwright browser automation to lightweight `httpx` with a highly optimized detection bypass:
-*   **False Positive Correction:** Resolved an issue where legitimate pages were flagged as "blocked" because they contained the word "cloudflare" (due to a CDN script). The new logic specifically targets actual Cloudflare Turnstile challenge patterns.
-*   **Jittered Delays:** Mimics human browsing by using random uniform delays between requests.
-*   **Header Rotation:** Uses realistic User-Agents and browser-standard headers.
+To read the data **latest → oldest**, query Supabase ordered by date:
 
-### 📊 Data Extraction Strategy
-1.  **JSON-LD First:** Prioritizes extracting structured data from `<script type="application/ld+json">`.
-2.  **HTML Table Fallback:** Dynamically parses the "Company Details" HTML table as a secondary source.
-3.  **Deduplication:** Uses content hashing to ensure data integrity across runs.
-
-### 📍 Intelligent Address Parsing
-Accurately extracts City and State from unstructured address strings by leveraging Indian State Codes and Pincode pattern recognition.
+```sql
+SELECT * FROM companies ORDER BY incorporation_date DESC NULLS LAST;
+```
 
 ---
 
-## 4. Data Flow
+## 3. System Architecture
 
-1.  **Discovery:** Crawls listing pages to populate the `company_urls` table.
-2.  **Queueing:** Fetches unscraped URLs from the database.
-3.  **Extraction:** Fetches and parses each company page using structured extraction logic.
-4.  **Persistence:** Saves company data to the `companies` table and updates the scrape status.
-5.  **Export:** Generates a timestamped CSV file in the `exports/` directory.
+```mermaid
+graph TD
+    A[bot.py: forever loop] --> B[crawler/discover.py]
+    A --> C[crawler/detail_scraper.py]
+    B --> F[crawler/fetch.py: httpx + browser fallback]
+    C --> F
+    B -->|URLs & state| D[(SQLite Queue)]
+    C -->|read queue| D
+    C -->|validated data| E[database/supabase_client.py]
+    E -->|upsert by CIN| G[(Supabase PostgreSQL)]
+```
+
+### Module Responsibilities
+- **`bot.py`** — forever loop: sweeps the bucket, recovers from any error with
+  exponential backoff, never exits on failure.
+- **`crawler/discover.py`** — crawls the `age-A` bucket, finds the live page
+  count, queues every company URL.
+- **`crawler/fetch.py`** — single resilient fetcher: httpx with retries, then a
+  Playwright browser fallback when Cloudflare blocks, then a cooldown.
+- **`crawler/detail_scraper.py`** — parses each company page (JSON-LD first,
+  HTML-table fallback), validates it, stores it.
+- **`database/db.py`** — SQLite work queue; a URL is "done" once `synced=1`.
+- **`database/supabase_client.py`** — Supabase upsert with retries.
 
 ---
 
-## 5. Usage
+## 4. Resilience (unattended VPS operation)
+
+* **Self-healing loop** — every exception is caught; the bot backs off
+  (60s, doubling up to 30min) and retries. It never dies.
+* **Cloudflare handling** — blocked requests retry, then fall back to a real
+  browser; persistent blocking triggers a 15-minute cooldown.
+* **Retry queue** — failed URLs are retried across sweeps up to
+  `MAX_URL_ATTEMPTS` times, then abandoned.
+* **Crash resilience** — a `systemd` service and a `run_forever.sh` wrapper
+  both restart the process if it ever exits.
+* **Log rotation** — `logs/scraper.log` is capped (5 MB × 5 files) so the disk
+  never fills.
+
+---
+
+## 5. Setup & Usage
+
+### Prerequisites
+1. Create a `.env` file based on `.env.example`:
+   ```
+   SUPABASE_URL="your-supabase-project-url"
+   SUPABASE_KEY="your-supabase-service-role-key"
+   ```
+2. Run the SQL in `supabase_schema.sql` in the Supabase dashboard.
+3. Install dependencies: `pip install -r requirements.txt`
+   (and `playwright install chromium` for the browser fallback).
+
+### Run it
 
 ```bash
-# Full execution
-python bot.py --start-page 1 --end-page 10 --limit 500
-
-# Single URL test
-python bot.py --test-url https://www.zaubacorp.com/company/EXAMPLE-URL
-
-# Export to CSV
-python bot.py --export
+python bot.py          # run forever
+python bot.py --once   # one sweep then exit (testing)
 ```
+
+### Keep it running on a VPS
+
+**Option A — systemd (recommended, auto-starts on reboot):**
+```bash
+sudo cp zauba-scraper.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now zauba-scraper
+journalctl -u zauba-scraper -f      # watch logs
+```
+
+**Option B — bash wrapper (no root needed):**
+```bash
+chmod +x run_forever.sh
+nohup ./run_forever.sh &
+```
+Add a `@reboot` crontab entry (see the comments in `run_forever.sh`) to also
+survive reboots.

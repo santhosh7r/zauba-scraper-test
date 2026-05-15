@@ -68,6 +68,17 @@ def extract_city(address: str | None) -> str | None:
     if not address:
         return None
 
+    # Comma-delimited format used on company pages:
+    #   "<street>, <locality>, <city>, <state>, India - <pin>"
+    # The city is the comma-separated part immediately before the state.
+    comma_parts = [p.strip() for p in address.split(",") if p.strip()]
+    if len(comma_parts) >= 2:
+        state = extract_state(address)
+        if state:
+            for i, part in enumerate(comma_parts):
+                if i > 0 and part.lower() == state.lower():
+                    return comma_parts[i - 1]
+
     parts = address.strip().split()
 
     # Find the position of a 2-letter state code

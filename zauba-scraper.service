@@ -1,0 +1,33 @@
+[Unit]
+# Zauba Corp continuous scraper — systemd service.
+#
+# Install:
+#   sudo cp /home/santhosh/dev/zauba_scraper/zauba-scraper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now zauba-scraper
+#
+# Watch it:
+#   systemctl status zauba-scraper
+#   journalctl -u zauba-scraper -f
+#
+# Stop it:
+#   sudo systemctl stop zauba-scraper
+Description=Zauba Corp Continuous Scraper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=santhosh
+WorkingDirectory=/home/santhosh/dev/zauba_scraper
+ExecStart=/home/santhosh/dev/zauba_scraper/venv/bin/python3 /home/santhosh/dev/zauba_scraper/bot.py
+
+# Restart on any exit (crash, error, or clean) and after a reboot.
+Restart=always
+RestartSec=30
+
+# Don't give up restarting, no matter how often it fails.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
